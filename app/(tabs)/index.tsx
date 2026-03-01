@@ -6,6 +6,9 @@ import { ActivityIndicator, Alert, Image, Modal, ScrollView, StyleSheet, Text, T
 import { checkImageQuality, getQualityFeedback, getQualityScore } from '../../utils/imageQuality';
 import { extractMedicationInfo, formatForSpeech, getMissingFieldsWarning, hasCriticalInfo } from '../../utils/medicalParser';
 import { categorizeMedicalText, extractText } from '../../utils/ocr';
+import { getHelpMessage, speakText as voiceSpeakText } from '../../utils/voiceHandler';
+
+
 
 export default function HomeScreen() {
   const [status, setStatus] = useState('Ready');
@@ -19,6 +22,8 @@ export default function HomeScreen() {
   const [qualityInfo, setQualityInfo] = useState<string>('');
   const [medicationInfo, setMedicationInfo] = useState<any>(null);
   const [missingFieldsWarning, setMissingFieldsWarning] = useState<string>('');
+  const [isListening, setIsListening] = useState(false);
+  const [lastTranscript, setLastTranscript] = useState('');
 
 
   const speakText = async (text: string) => {
@@ -30,6 +35,62 @@ export default function HomeScreen() {
       });
     } catch (error) {
       console.error('Speech error:', error);
+    }
+  };
+  // Separate function for OCR processing
+  const proceedWithOCR = async (imageUri: string): Promise<boolean> => {
+    try {
+      setStatus('Extracting text...');
+      const ocrResult = await extractText(imageUri);
+      
+      if (!ocrResult.text || ocrResult.text.trim().length < 10) {
+        // OCR returned nothing or very little text
+        console.log('❌ OCR failed - no text extracted');
+        setStatus('Failed to extract text');
+        setIsProcessing(false);
+        return false; // ← RETURN FALSE
+      }
+      
+      setExtractedText(ocrResult.text);
+      
+      const category = categorizeMedicalText(ocrResult.text);
+      setTextCategory(category);
+      
+      const medInfo = extractMedicationInfo(ocrResult.text);
+      setMedicationInfo(medInfo);
+      
+      console.log('=== MEDICATION INFO SET ===');
+      console.log('Full medInfo object:', JSON.stringify(medInfo, null, 2));
+      
+      // Check if we got critical information
+      const hasCritical = hasCriticalInfo(medInfo);
+      
+      if (!hasCritical) {
+        // No critical info extracted
+        console.log('❌ No critical medication info extracted');
+        setStatus('Could not identify medication information');
+        setIsProcessing(false);
+        return false; // ← RETURN FALSE
+      }
+      
+      const missingWarning = getMissingFieldsWarning(medInfo);
+      if (missingWarning) {
+        setMissingFieldsWarning(missingWarning);
+      }
+      
+      const speechText = formatForSpeech(medInfo);
+      
+      setStatus(`Found ${category}`);
+      await speakText(`Found ${category}. ${speechText}`);
+      
+      setIsProcessing(false);
+      return true; // ← RETURN TRUE (success!)
+      
+    } catch (error) {
+      console.error('OCR error:', error);
+      setStatus('OCR failed');
+      setIsProcessing(false);
+      return false; // ← RETURN FALSE
     }
   };
 
@@ -47,73 +108,233 @@ export default function HomeScreen() {
     speakText('Camera opened. Point at text and tap capture');
   };
 
-  const takePicture = async () => {
-    if (cameraRef.current) {
-      try {
-        const photo = await cameraRef.current.takePictureAsync({
-          quality: 0.8,
-        });
+ const takePicture = async () => {
+  if (cameraRef.current) {
+    try {
+      const photo = await cameraRef.current.takePictureAsync({
+        quality: 0.8,
+      });
+      
+      setShowCamera(false);
+      setCapturedImage(photo.uri);
+      setStatus('Checking image quality...');
+      setIsProcessing(true);
+      
+      // Check quality
+      const qualityResult = await checkImageQuality(
+        photo.uri,
+        photo.width,
+        photo.height
+      );
+      
+      const score = getQualityScore(qualityResult);
+      
+      if (!qualityResult.isGoodQuality) {
+        // Low quality detected - show warning but proceed anyway
+        setQualityInfo(`⚠️ Quality: ${score} - ${qualityResult.issues.join(', ')}`);
+        setStatus('Low quality detected - attempting OCR...');
+        console.log('⚠️ Quality warning:', qualityResult.issues);
         
-        setShowCamera(false);
-        setCapturedImage(photo.uri);
-        setStatus('Checking image quality...');
-        setIsProcessing(true);
+        // Try OCR despite low quality
+        const success = await proceedWithOCR(photo.uri);
         
-        // Check quality
-        const qualityResult = await checkImageQuality(
-          photo.uri,
-          photo.width,
-          photo.height
-        );
-        
-        if (!qualityResult.isGoodQuality) {
-          //setQualityInfo(`⚠️ ${qualityResult.issues.join(', ')}`);
-          const score = getQualityScore(qualityResult);
-          setQualityInfo(`⚠️ Quality: ${score} - ${qualityResult.issues.join(', ')}`);
-          setStatus('Quality warning - retake recommended');
-          speakText(`Warning: ${qualityResult.suggestions[0] || 'Image quality is low'}`);
-          
+        // If OCR completely failed, THEN ask to retake
+        if (!success) {
           Alert.alert(
-            'Quality Warning',
-            `${getQualityFeedback(qualityResult)}\n\nRetake photo or proceed?`,
+            'Cannot Read Label',
+            `Image quality is too low to extract information.\n\n${getQualityFeedback(qualityResult)}\n\nPlease retake the photo.`,
             [
               {
-                text: 'Retake',
+                text: 'Retake Photo',
                 onPress: () => {
                   setShowCamera(true);
                   setIsProcessing(false);
                 }
-              },
-              {
-                text: 'Proceed',
-                onPress: () => proceedWithOCR(photo.uri)
               }
             ]
           );
-        } else {
-          //setQualityInfo('✓ Quality OK');
-          const score = getQualityScore(qualityResult);
-          setQualityInfo(`✓ Quality: ${score}`);
-          await proceedWithOCR(photo.uri);
         }
-        
-      } catch (error) {
-        Alert.alert('Error', 'Failed to capture image');
-        setIsProcessing(false);
+      } else {
+        // Good quality
+        setQualityInfo(`✓ Quality: ${score}`);
+        await proceedWithOCR(photo.uri);
       }
+      
+    } catch (error) {
+      Alert.alert('Error', 'Failed to capture image');
+      setIsProcessing(false);
     }
-  };
+  }
+};
 
   const testSpeaker = () => {
     speakText('Hello! This is the Blind Assistant test. Audio is working.');
     setStatus('Testing speaker...');
   };
 
-  const handleVoice = () => {
-    setStatus('Voice command pressed!');
-    speakText('Voice command feature coming in Week 4');
-  };
+// Line 117 - Define submenu functions FIRST
+const showBasicInfoCommands = () => {
+  Alert.alert(
+    'Basic Info Commands',
+    'What would you like to know?',
+    [
+      {
+        text: '📋 What is it?',
+        onPress: async () => {
+          if (medicationInfo) {
+            let parts = [];
+            if (medicationInfo.drugName) parts.push(medicationInfo.drugName);
+            if (medicationInfo.medicationType) parts.push(medicationInfo.medicationType.toLowerCase());
+            if (medicationInfo.dosageAmount) parts.push(`Strength: ${medicationInfo.dosageAmount}`);
+            if (medicationInfo.quantity) parts.push(`Quantity: ${medicationInfo.quantity}`);
+            
+            if (parts.length > 0) {
+              await voiceSpeakText(parts.join('. '));
+            } else {
+              await voiceSpeakText('Medication information not complete');
+            }
+          } else {
+            await voiceSpeakText('No medication scanned yet');
+          }
+        }
+      },
+      {
+        text: '💊 What\'s the dosage?',
+        onPress: async () => {
+          await executeVoiceCommand('read_dosage');
+        }
+      },
+      {
+        text: '📋 What\'s it for?',
+        onPress: async () => {
+          await executeVoiceCommand('read_purpose');
+        }
+      },
+      {
+        text: '◀️ Back',
+        onPress: () => handleVoice()
+      }
+    ],
+    { cancelable: true }
+  );
+};
 
+const showUsageCommands = () => {
+  Alert.alert(
+    'Usage Commands',
+    'How to use this medication:',
+    [
+      {
+        text: '📖 Instructions',
+        onPress: async () => {
+          await executeVoiceCommand('read_instructions');
+        }
+      },
+      {
+        text: '⏰ When to take?',
+        onPress: async () => {
+          if (medicationInfo?.timing) {
+            await voiceSpeakText(`Timing: ${medicationInfo.timing}`);
+          } else if (medicationInfo?.dosageInstructions) {
+            await voiceSpeakText(medicationInfo.dosageInstructions);
+          } else {
+            await voiceSpeakText('Timing information not found');
+          }
+        }
+      },
+      {
+        text: '💊 How do I take it?',
+        onPress: async () => {
+          if (medicationInfo?.dosageInstructions) {
+            let response = medicationInfo.dosageInstructions;
+            if (medicationInfo.timing) {
+              response += `. ${medicationInfo.timing}`;
+            }
+            await voiceSpeakText(response);
+          } else {
+            await voiceSpeakText('Instructions not found');
+          }
+        }
+      },
+      {
+        text: '◀️ Back',
+        onPress: () => handleVoice()
+      }
+    ],
+    { cancelable: true }
+  );
+};
+
+const showSafetyCommands = () => {
+  Alert.alert(
+    'Safety Info Commands',
+    'Safety information:',
+    [
+      {
+        text: '⚠️ Any warnings?',
+        onPress: async () => {
+          await executeVoiceCommand('read_warnings');
+        }
+      },
+      {
+        text: '📅 Expiration date?',
+        onPress: async () => {
+          await executeVoiceCommand('read_expiration');
+        }
+      },
+      {
+        text: '🏥 Where prescribed?',
+        onPress: async () => {
+          if (medicationInfo?.pharmacy) {
+            await voiceSpeakText(`From: ${medicationInfo.pharmacy}`);
+          } else if (medicationInfo?.prescriptionDate) {
+            await voiceSpeakText(`Prescribed on: ${medicationInfo.prescriptionDate}`);
+          } else {
+            await voiceSpeakText('Clinic information not found');
+          }
+        }
+      },
+      {
+        text: '◀️ Back',
+        onPress: () => handleVoice()
+      }
+    ],
+    { cancelable: true }
+  );
+};
+
+// NOW define handleVoice LAST (after the submenu functions exist)
+const handleVoice = () => {
+  Alert.alert(
+    'Voice Command',
+    'Choose a category:',
+    [
+      {
+        text: '📋 Basic Info',
+        onPress: () => showBasicInfoCommands()
+      },
+      {
+        text: '💊 Usage Info',
+        onPress: () => showUsageCommands()
+      },
+      {
+        text: '⚠️ Safety Info',
+        onPress: () => showSafetyCommands()
+      },
+      {
+        text: '🔁 Repeat All',
+        onPress: async () => {
+          await executeVoiceCommand('repeat');
+        }
+      },
+      {
+        text: 'Cancel',
+        style: 'cancel'
+      }
+    ],
+    { cancelable: true }
+  );
+};
   const pickImage = async () => {
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (status !== 'granted') {
@@ -135,122 +356,162 @@ export default function HomeScreen() {
       setCapturedImage(imageUri);
       setStatus('Checking image quality...');
       setIsProcessing(true);
+    
+    try {
+      // Check quality first
+      const qualityResult = await checkImageQuality(imageUri, imageWidth, imageHeight);
+      const score = getQualityScore(qualityResult);
       
-      try {
-        // STEP 1: Check quality first
-        const qualityResult = await checkImageQuality(imageUri, imageWidth, imageHeight);
+      if (!qualityResult.isGoodQuality) {
+        // Low quality - show warning but try OCR anyway
+        setQualityInfo(`⚠️ Quality: ${score} - ${qualityResult.issues.join(', ')}`);
+        setStatus('Low quality detected - attempting OCR...');
+        console.log('⚠️ Quality warning:', qualityResult.issues);
         
-        if (!qualityResult.isGoodQuality) {
-          // Show quality warnings
-          const feedback = getQualityFeedback(qualityResult);
-          //setQualityInfo(`⚠️ ${qualityResult.issues.join(', ')}`);
-          const score = getQualityScore(qualityResult);
-          setQualityInfo(`⚠️ Quality: ${score} - ${qualityResult.issues.join(', ')}`);
-          setStatus(`Quality Warning: ${qualityResult.issues.join(', ')}`);
-          speakText(`Warning: ${qualityResult.suggestions.join('. ')}`);
-          
-          // Ask user if they want to proceed
+        const success = await proceedWithOCR(imageUri);
+        
+        // Only alert if OCR completely failed
+        if (!success) {
           Alert.alert(
-            'Image Quality Warning',
-            `${feedback}\n\nProceed with OCR anyway?`,
+            'Cannot Read Label',
+            `Unable to extract medication information from this image.\n\n${getQualityFeedback(qualityResult)}\n\nPlease choose a clearer image.`,
             [
+              {
+                text: 'Choose Another',
+                onPress: () => pickImage()
+              },
               {
                 text: 'Cancel',
                 style: 'cancel',
-                onPress: () => {
-                  setIsProcessing(false);
-                  setStatus('Image quality too low. Please try again.');
-                }
-              },
-              {
-                text: 'Proceed Anyway',
-                onPress: () => proceedWithOCR(imageUri)
+                onPress: () => setIsProcessing(false)
               }
             ]
           );
-        } else {
-          // Quality is good, proceed
-          const score = getQualityScore(qualityResult);
-          setQualityInfo(`✓ Quality: ${score}`);
-          //setQualityInfo('✓ Quality OK');
-          setStatus('Quality check passed. Processing...');
-          speakText('Image quality good. Processing text.');
-          await proceedWithOCR(imageUri);
         }
-        
-      } catch (error) {
-        console.error('Quality check error:', error);
-        // If quality check fails, still try OCR
+      } else {
+        // Good quality
+        setQualityInfo(`✓ Quality: ${score}`);
         await proceedWithOCR(imageUri);
       }
+      
+    } catch (error) {
+      console.error('Image processing error:', error);
+      setStatus('Failed to process image');
+      setIsProcessing(false);
     }
+    }   
   };
 
-  // Separate function for OCR processing
-const proceedWithOCR = async (imageUri: string) => {
-  try {
-    setStatus('Extracting text...');
-    const ocrResult = await extractText(imageUri);
-    
-    if (ocrResult.text.trim().length > 0) {
-      setExtractedText(ocrResult.text);
+const executeVoiceCommand = async (action: string) => {
+  console.log('Executing voice command:', action);
+  
+  switch (action) {
+    case 'read_full':
+      setStatus('Taking photo...');
+      await voiceSpeakText('Taking photo now');
+      await takePicture();
+      break;
       
-      // Categorize as medical
-      const category = categorizeMedicalText(ocrResult.text);
-      setTextCategory(category);
-      
-      // Extract medical information
-      const medInfo = extractMedicationInfo(ocrResult.text);
-      setMedicationInfo(medInfo);
-      
-      // Check for missing fields
-      const missingWarning = getMissingFieldsWarning(medInfo);
-      if (missingWarning) {
-        setMissingFieldsWarning(missingWarning);
+    case 'read_dosage':
+      if (medicationInfo?.dosageAmount) {
+        await voiceSpeakText(`Dosage: ${medicationInfo.dosageAmount}`);
+        setStatus(`Spoke: Dosage ${medicationInfo.dosageAmount}`);
+      } else if (medicationInfo) {
+        await voiceSpeakText('Dosage amount not found on this label');
+        setStatus('Dosage not found');
       } else {
-        setMissingFieldsWarning('');
+        await voiceSpeakText('No medication scanned yet. Please scan a label first.');
+        setStatus('No medication scanned');
       }
+      break;
       
-      // Format for speech
-      const speechText = formatForSpeech(medInfo);
-      
-      // Check if we have critical info
-      if (hasCriticalInfo(medInfo)) {
-        setStatus(`Found ${category}`);
-        speakText(`Found ${category}. ${speechText}`);
-        
-        // Also speak missing fields warning if present
-        if (missingWarning) {
-          setTimeout(() => {
-            speakText(missingWarning);
-          }, 2000); // Delay to speak after main info
-        }
+    case 'read_purpose':
+      if (medicationInfo?.purpose) {
+        await voiceSpeakText(`Purpose: ${medicationInfo.purpose}`);
+        setStatus(`Spoke: ${medicationInfo.purpose}`);
+      } else if (medicationInfo) {
+        await voiceSpeakText('Purpose not found on this label');
+        setStatus('Purpose not found');
       } else {
-        setStatus('Incomplete information detected');
-        setExtractedText('Critical information missing');
-        speakText('Unable to read complete medication information. Please ensure the entire label is visible and try again.');
+        await voiceSpeakText('No medication scanned yet.');
+        setStatus('No medication scanned');
       }
-    } else {
-      setExtractedText('No text found');
-      setStatus('No text detected in image');
-      speakText('No text found in image');
-    }
-  } catch (error) {
-    console.error('OCR error:', error);
-    const errorMsg = error instanceof Error ? error.message : 'Unknown error';
-    setStatus(`Error: ${errorMsg}`);
-    setExtractedText(`Error: ${errorMsg}`);
-  } finally {
-    setIsProcessing(false);
+      break;
+      
+    case 'read_warnings':
+      if (medicationInfo?.warnings && medicationInfo.warnings.length > 0) {
+        await voiceSpeakText(`Warnings: ${medicationInfo.warnings.join('. ')}`);
+        setStatus(`Spoke warnings`);
+      } else if (medicationInfo) {
+        await voiceSpeakText('No warnings detected on this label');
+        setStatus('No warnings found');
+      } else {
+        await voiceSpeakText('No medication scanned yet. Please scan a label first.');
+        setStatus('No medication scanned');
+      }
+      break;
+      
+    case 'read_expiration':
+      if (medicationInfo?.expirationDate) {
+        await voiceSpeakText(`Expires: ${medicationInfo.expirationDate}`);
+        setStatus(`Spoke: Expires ${medicationInfo.expirationDate}`);
+      } else if (medicationInfo?.prescriptionDate) {
+        await voiceSpeakText(`Prescription date: ${medicationInfo.prescriptionDate}`);
+        setStatus(`Spoke prescription date`);
+      } else if (medicationInfo) {
+        await voiceSpeakText('No expiration date found');
+        setStatus('No expiration found');
+      } else {
+        await voiceSpeakText('No medication scanned yet.');
+        setStatus('No medication scanned');
+      }
+      break;
+      
+    case 'read_instructions':
+      if (medicationInfo?.dosageInstructions) {
+        await voiceSpeakText(`Instructions: ${medicationInfo.dosageInstructions}`);
+        setStatus(`Spoke instructions`);
+      } else if (medicationInfo) {
+        await voiceSpeakText('No instructions found');
+        setStatus('Instructions not found');
+      } else {
+        await voiceSpeakText('No medication scanned yet.');
+        setStatus('No medication scanned');
+      }
+      break;
+      
+    case 'repeat':
+      if (medicationInfo) {
+        const speechText = formatForSpeech(medicationInfo);
+        await voiceSpeakText(speechText);
+        setStatus('Repeated medication info');
+      } else {
+        await voiceSpeakText('Nothing to repeat. Please scan a label first.');
+        setStatus('Nothing to repeat');
+      }
+      break;
+      
+    case 'help':
+      const helpText = getHelpMessage();
+      await voiceSpeakText(helpText);
+      setStatus('Spoke help message');
+      break;
+      
+    default:
+      await voiceSpeakText('Unknown command');
+      setStatus('Unknown command');
+      console.log('Unknown action:', action);
   }
 };
+
+
   
   return (
     <View style={styles.container}>
       <ScrollView contentContainerStyle={styles.scrollContent}>
         <View style={styles.header}>
-          <Text style={styles.title}>Blind Assistant</Text>
-          <Text style={styles.subtitle}>Week 2: OCR Integration</Text>
+          <Text style={styles.title}>MediSense AI</Text>
+          <Text style={styles.subtitle}>Medical Label Reader</Text>
         </View>
 
         <View style={styles.statusContainer}>
@@ -278,50 +539,88 @@ const proceedWithOCR = async (imageUri: string) => {
         <Text style={styles.textCategoryLabel}>Category: {textCategory}</Text>
         
         {/* Show extracted medical information */}
-        {medicationInfo && (
-          <View style={styles.medInfoContainer}>
-            {medicationInfo.drugName && (
-              <Text style={styles.medInfoField}>
-                <Text style={styles.medInfoLabel}>Drug: </Text>
-                {medicationInfo.drugName}
-              </Text>
-            )}
-            
-            {medicationInfo.dosageAmount && (
-              <Text style={styles.medInfoField}>
-                <Text style={styles.medInfoLabel}>Dosage: </Text>
-                {medicationInfo.dosageAmount}
-              </Text>
-            )}
-            
-            {medicationInfo.dosageInstructions && (
-              <Text style={styles.medInfoField}>
-                <Text style={styles.medInfoLabel}>Instructions: </Text>
-                {medicationInfo.dosageInstructions}
-              </Text>
-            )}
-            
-            {medicationInfo.timing && (
-              <Text style={styles.medInfoField}>
-                <Text style={styles.medInfoLabel}>Timing: </Text>
-                {medicationInfo.timing}
-              </Text>
-            )}
-            
-            {medicationInfo.warnings && medicationInfo.warnings.length > 0 && (
-              <Text style={styles.medInfoWarning}>
-                ⚠️ {medicationInfo.warnings.join(', ')}
-              </Text>
-            )}
-            
-            {medicationInfo.expirationDate && (
-              <Text style={styles.medInfoField}>
-                <Text style={styles.medInfoLabel}>Expires: </Text>
-                {medicationInfo.expirationDate}
-              </Text>
-            )}
-          </View>
-        )}
+       {medicationInfo && (
+  <View style={styles.medInfoContainer}>
+    {medicationInfo.drugName && (
+      <View style={styles.medInfoField}>
+        <Text style={styles.medInfoLabel}>Drug:</Text>
+        <Text style={styles.medInfoValue}>{medicationInfo.drugName}</Text>
+      </View>
+    )}
+    
+    {medicationInfo.medicationType && (
+      <View style={styles.medInfoField}>
+        <Text style={styles.medInfoLabel}>Type:</Text>
+        <Text style={styles.medInfoValue}>{medicationInfo.medicationType}</Text>
+      </View>
+    )}
+    
+    {medicationInfo.quantity && (
+      <View style={styles.medInfoField}>
+        <Text style={styles.medInfoLabel}>Quantity:</Text>
+        <Text style={styles.medInfoValue}>{medicationInfo.quantity}</Text>
+      </View>
+    )}
+    
+    {medicationInfo.dosageAmount && (
+      <View style={styles.medInfoField}>
+        <Text style={styles.medInfoLabel}>Dosage:</Text>
+        <Text style={styles.medInfoValue}>{medicationInfo.dosageAmount}</Text>
+      </View>
+    )}
+    
+    {medicationInfo.dosageInstructions && (
+      <View style={styles.medInfoField}>
+        <Text style={styles.medInfoLabel}>Instructions:</Text>
+        <Text style={styles.medInfoValue}>{medicationInfo.dosageInstructions}</Text>
+      </View>
+    )}
+    
+    {medicationInfo.timing && (
+      <View style={styles.medInfoField}>
+        <Text style={styles.medInfoLabel}>Timing:</Text>
+        <Text style={styles.medInfoValue}>{medicationInfo.timing}</Text>
+      </View>
+    )}
+    
+    {medicationInfo.purpose && (
+      <View style={styles.medInfoField}>
+        <Text style={styles.medInfoLabel}>Purpose:</Text>
+        <Text style={styles.medInfoValue}>{medicationInfo.purpose}</Text>
+      </View>
+    )}
+    
+    {medicationInfo.warnings && medicationInfo.warnings.length > 0 && (
+      <View style={styles.medInfoField}>
+        <Text style={[styles.medInfoLabel, styles.medInfoWarning]}>⚠️ Warnings:</Text>
+        <Text style={styles.medInfoWarning}>
+          {medicationInfo.warnings.join(', ')}
+        </Text>
+      </View>
+    )}
+    
+    {medicationInfo.expirationDate && (
+      <View style={styles.medInfoField}>
+        <Text style={styles.medInfoLabel}>Expires:</Text>
+        <Text style={styles.medInfoValue}>{medicationInfo.expirationDate}</Text>
+      </View>
+    )}
+    
+    {medicationInfo.prescriptionDate && (
+      <View style={styles.medInfoField}>
+        <Text style={styles.medInfoLabel}>Prescribed:</Text>
+        <Text style={styles.medInfoValue}>{medicationInfo.prescriptionDate}</Text>
+      </View>
+    )}
+    
+    {medicationInfo.pharmacy && (
+      <View style={styles.medInfoField}>
+        <Text style={styles.medInfoLabel}>Clinic:</Text>
+        <Text style={styles.medInfoValue}>{medicationInfo.pharmacy}</Text>
+      </View>
+    )}
+  </View>
+)}
         
         {/* Show missing fields warning */}
         {missingFieldsWarning && (
@@ -361,20 +660,16 @@ const proceedWithOCR = async (imageUri: string) => {
           >
             <Text style={styles.buttonText}>🎤 Voice Command</Text>
           </TouchableOpacity>
-
+        {/* Remove test function
           <TouchableOpacity 
             style={[styles.button, styles.secondaryButton]}
             onPress={testSpeaker}
           >
             <Text style={styles.buttonText}>🔊 Test Speaker</Text>
           </TouchableOpacity>
+        */}
         </View>
 
-        <View style={styles.footer}>
-          <Text style={styles.footerText}>✓ Week 1: Camera</Text>
-          <Text style={styles.footerText}>✓ Week 2: Medical Label OCR</Text>
-          <Text style={styles.footerText}>→ Next: Enhanced Medical Parsing</Text>
-        </View>
       </ScrollView>
 
       <Modal visible={showCamera} animationType="slide">

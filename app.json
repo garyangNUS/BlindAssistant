@@ -26,7 +26,8 @@
         {
           "microphonePermission": "Allow BlindAssistant to access your microphone."
         }
-      ]
+      ],
+      "expo-speech-recognition"
     ],
     "experiments": {
       "typedRoutes": true
