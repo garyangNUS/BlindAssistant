@@ -1,12 +1,13 @@
+import Voice from '@react-native-voice/voice';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as ImagePicker from 'expo-image-picker';
 import * as Speech from 'expo-speech';
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import { ActivityIndicator, Alert, Image, Modal, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { checkImageQuality, getQualityFeedback, getQualityScore } from '../../utils/imageQuality';
 import { extractMedicationInfo, formatForSpeech, getMissingFieldsWarning, hasCriticalInfo } from '../../utils/medicalParser';
 import { categorizeMedicalText, extractText } from '../../utils/ocr';
-import { getHelpMessage, speakText as voiceSpeakText } from '../../utils/voiceHandler';
+import { getHelpMessage, matchIntent, speakText as voiceSpeakText } from '../../utils/voiceHandler';
 
 
 
@@ -24,7 +25,22 @@ export default function HomeScreen() {
   const [missingFieldsWarning, setMissingFieldsWarning] = useState<string>('');
   const [isListening, setIsListening] = useState(false);
   const [lastTranscript, setLastTranscript] = useState('');
+  const voiceContextRef = useRef<'main' | 'camera'>('main');
 
+// Cleanup voice when component unmounts
+React.useEffect(() => {
+  return () => {
+    Voice.destroy().then(Voice.removeAllListeners);
+  };
+}, []);
+
+React.useEffect(() => {
+  if (!showCamera) {
+    console.log('📷 Camera closed - stopping voice');
+    Voice.stop();
+    Voice.removeAllListeners();
+  }
+}, [showCamera]);
 
   const speakText = async (text: string) => {
     try {
@@ -37,9 +53,25 @@ export default function HomeScreen() {
       console.error('Speech error:', error);
     }
   };
+  const stopSpeaking = () => {
+    try {
+      Speech.stop();
+      console.log('🔇 Audio stopped');
+    } catch (error) {
+      console.error('Error stopping speech:', error);
+    }
+  };
   // Separate function for OCR processing
   const proceedWithOCR = async (imageUri: string): Promise<boolean> => {
     try {
+      // Clear old data FIRST (before starting new OCR)
+      console.log('🧹 Clearing old medication data before new scan');
+      setExtractedText('');
+      setTextCategory('');
+      setMedicationInfo(null);
+      setMissingFieldsWarning('');
+      setQualityInfo('');
+
       setStatus('Extracting text...');
       const ocrResult = await extractText(imageUri);
       
@@ -47,6 +79,9 @@ export default function HomeScreen() {
         // OCR returned nothing or very little text
         console.log('❌ OCR failed - no text extracted');
         setStatus('Failed to extract text');
+       
+        // SPEAK ERROR MESSAGE
+        await speakText('Cannot detect any text in the image. Please retake the photo with better lighting and focus.');
         setIsProcessing(false);
         return false; // ← RETURN FALSE
       }
@@ -69,6 +104,13 @@ export default function HomeScreen() {
         // No critical info extracted
         console.log('❌ No critical medication info extracted');
         setStatus('Could not identify medication information');
+        // CLEAR MEDICATION DATA (keep extracted text for debugging)
+        setTextCategory('Unknown');
+        setMedicationInfo(null);
+        setMissingFieldsWarning('No medication information found');
+
+        // SPEAK ERROR MESSAGE
+        await speakText('Could not identify medication information from the image. Please ensure the label is clearly visible and retake the photo.');      
         setIsProcessing(false);
         return false; // ← RETURN FALSE
       }
@@ -89,6 +131,13 @@ export default function HomeScreen() {
     } catch (error) {
       console.error('OCR error:', error);
       setStatus('OCR failed');
+      // CLEAR ALL DATA
+      setExtractedText('');
+      setTextCategory('');
+      setMedicationInfo(null);
+      setMissingFieldsWarning('');
+      setQualityInfo('');
+      await speakText('An error occurred while reading the label. Please try again.');
       setIsProcessing(false);
       return false; // ← RETURN FALSE
     }
@@ -102,19 +151,133 @@ export default function HomeScreen() {
         return;
       }
     }
-
+    // CRITICAL: Set context to camera BEFORE opening
+    console.log('🔄 Setting voice context to CAMERA');
+    voiceContextRef.current = 'camera'; // CHANGED
+    
     setShowCamera(true);
     setStatus('Camera opened - Point at text');
-    speakText('Camera opened. Point at text and tap capture');
+    speakText('Camera opened. Point at text and say capture, or tap the button');
+
+     // Start voice listening for camera capture
+     // Start camera-specific voice listener
+    setTimeout(async () => {
+    setupVoiceHandler();
+    // Small delay before starting
+    await new Promise(resolve => setTimeout(resolve, 500));
+    console.log('🎤 Starting voice recognition...');
+    await Voice.start('en-US');
+    console.log('✅ Camera voice active');
+    }, 2000);
   };
 
+// UNIFIED VOICE HANDLER - handles both contexts
+const setupVoiceHandler = () => {
+  Voice.onSpeechResults = (e) => {
+    if (e.value && e.value.length > 0) {
+      const transcript = e.value[0];
+      console.log('🎤 Voice heard:', transcript);
+      console.log('📍 Current voice context:', voiceContextRef.current); // ADD THIS DEBUG LINE
+      // Route based on context
+      if (voiceContextRef.current === 'camera') {
+        // CAMERA CONTEXT
+        handleCameraVoiceCommand(transcript);
+      } else {
+        // MAIN CONTEXT
+        handleMainVoiceCommand(transcript);
+      }
+    }
+  };
+  
+  Voice.onSpeechError = (e) => {
+    console.log('⚠️ Voice error:', e);
+  };
+  
+  Voice.onSpeechEnd = () => {
+    console.log('🔄 Speech ended');
+    
+    // Restart if in camera context
+    if (voiceContextRef.current === 'camera' && showCamera) {
+      setTimeout(async () => {
+        if (showCamera) {
+          try {
+            await Voice.start('en-US');
+            console.log('✅ Camera listener restarted');
+          } catch (err) {
+            console.log('Restart error:', err);
+          }
+        }
+      }, 500);
+    }
+  };
+};
+
+const handleCameraVoiceCommand = async (transcript: string) => {
+  const text = transcript.toLowerCase();
+  console.log('📷 Camera processing:', text);
+  
+  // CANCEL
+  if (text.match(/cancel|close|exit|stop|abort|back/)) {
+    console.log('✅ Cancel detected');
+    await Voice.stop();
+    speakText('Cancelled');
+    setShowCamera(false);
+    voiceContextRef.current = 'main'; // CHANGED
+    return;
+  }
+  
+  // CAPTURE
+  if (text.match(/capture|click|snap|shoot|take|photo|picture/)) {
+    console.log('✅ Capture detected');
+    await Voice.stop();
+    speakText('Capturing');
+    voiceContextRef.current = 'main'; // CHANGED
+    console.log('📸 Calling takePicture...');
+    await takePicture();  // ← ADD AWAIT
+    console.log('📸 takePicture completed');
+    return;
+  }
+  
+  // Unknown
+  console.log('❓ Unknown camera command');
+  speakText('Say capture to take photo, or cancel to close');
+};
+
+const handleMainVoiceCommand = async (transcript: string) => {
+  console.log('🏠 Main processing:', transcript);
+  
+  setStatus(`You said: "${transcript}"`);
+  setIsListening(false);
+  
+  // Use matcher
+  const command = matchIntent(transcript);
+  console.log('Matched command:', command);
+  
+  if (command.confidence > 0.5) {
+    await Voice.stop();
+    executeVoiceCommand(command.action);
+  } else {
+    voiceSpeakText('Sorry, I did not understand that command.');
+  }
+};
+
+
  const takePicture = async () => {
+  console.log('📸 ========== takePicture ENTERED ==========');
+  console.log('📸 cameraRef exists?', !!cameraRef);
+  console.log('📸 cameraRef.current exists?', !!cameraRef.current);
   if (cameraRef.current) {
-    try {
-      const photo = await cameraRef.current.takePictureAsync({
-        quality: 0.8,
-      });
+    try {      
+       // Stop voice listener when capturing
+      console.log('📸 Stopping voice...');
+      await Voice.stop();
       
+      console.log('📸 Calling takePictureAsync...');
+      const photo = await cameraRef.current.takePictureAsync({
+        quality: 0.3,
+        base64: false,
+      });
+      console.log('📸 Photo captured!', photo.uri);
       setShowCamera(false);
       setCapturedImage(photo.uri);
       setStatus('Checking image quality...');
@@ -140,14 +303,27 @@ export default function HomeScreen() {
         
         // If OCR completely failed, THEN ask to retake
         if (!success) {
+          // SPEAK THE ERROR MESSAGE
+          const errorMessage = `Cannot read the label. ${getQualityFeedback(qualityResult)}. Please retake the photo.`;
+          await speakText(errorMessage);
           Alert.alert(
             'Cannot Read Label',
             `Image quality is too low to extract information.\n\n${getQualityFeedback(qualityResult)}\n\nPlease retake the photo.`,
             [
               {
                 text: 'Retake Photo',
-                onPress: () => {
+                onPress: async () => {
+                  stopSpeaking();
+                  await speakText('Opening camera. Point at the label and tap capture.');
                   setShowCamera(true);
+                  setIsProcessing(false);
+                }
+              },
+              {
+                text: 'Cancel',
+                style: 'cancel',
+                onPress: () => {
+                  stopSpeaking();
                   setIsProcessing(false);
                 }
               }
@@ -304,7 +480,8 @@ const showSafetyCommands = () => {
 };
 
 // NOW define handleVoice LAST (after the submenu functions exist)
-const handleVoice = () => {
+
+const showVoiceMenu = () => {
   Alert.alert(
     'Voice Command',
     'Choose a category:',
@@ -334,7 +511,38 @@ const handleVoice = () => {
     ],
     { cancelable: true }
   );
+}; 
+
+const handleVoice = async () => {
+  try {
+    setIsListening(true);
+    voiceContextRef.current = 'main'; // CHANGED
+    setStatus('🎤 Listening... Speak now');
+    await voiceSpeakText('Listening');
+    
+    // Set up handlers
+    setupVoiceHandler();
+    
+    // Start listening
+    await Voice.start('en-US');
+    
+    // Timeout
+    setTimeout(async () => {
+      if (isListening) {
+        console.log('Listening timed out');
+        setIsListening(false);
+        await Voice.stop();
+        voiceSpeakText('Listening timed out');
+      }
+    }, 10000);
+    
+  } catch (error) {
+    console.error('Voice error:', error);
+    setIsListening(false);
+    showVoiceMenu();
+  }
 };
+
   const pickImage = async () => {
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (status !== 'granted') {
@@ -353,6 +561,13 @@ const handleVoice = () => {
       const imageWidth = result.assets[0].width;
       const imageHeight = result.assets[0].height;
       
+  // CLEAR OLD DATA before processing new image
+      setExtractedText('');
+      setTextCategory('');
+      setMedicationInfo(null);
+      setMissingFieldsWarning('');
+      setQualityInfo('');
+
       setCapturedImage(imageUri);
       setStatus('Checking image quality...');
       setIsProcessing(true);
@@ -406,12 +621,28 @@ const executeVoiceCommand = async (action: string) => {
   console.log('Executing voice command:', action);
   
   switch (action) {
-    case 'read_full':
-      setStatus('Taking photo...');
-      await voiceSpeakText('Taking photo now');
-      await takePicture();
+    case 'read_clinic':
+      if (medicationInfo?.pharmacy) {
+        await voiceSpeakText(`From: ${medicationInfo.pharmacy}`);
+      } else if (medicationInfo?.prescriptionDate) {
+        await voiceSpeakText(`Prescribed on: ${medicationInfo.prescriptionDate}`);
+      } else {
+        await voiceSpeakText('Clinic information not found');
+      }
       break;
-      
+
+    case 'read_full':
+      // Check if medication info exists
+      if (medicationInfo) {
+        const speechText = formatForSpeech(medicationInfo);
+        await voiceSpeakText(speechText);
+        setStatus('Spoke full medication info');
+      } else {
+        await voiceSpeakText('No medication scanned yet. Please scan a label first.');
+        setStatus('No medication scanned');
+      }
+      break;
+
     case 'read_dosage':
       if (medicationInfo?.dosageAmount) {
         await voiceSpeakText(`Dosage: ${medicationInfo.dosageAmount}`);
@@ -496,7 +727,20 @@ const executeVoiceCommand = async (action: string) => {
       await voiceSpeakText(helpText);
       setStatus('Spoke help message');
       break;
+
+    case 'take_photo':
+      console.log('📸 TAKE PHOTO CASE TRIGGERED');  
+    // Stop current voice listener
+      await Voice.stop();
+      setIsListening(false);
+      voiceContextRef.current = 'camera'; // CHANGED
+      await voiceSpeakText('Opening camera');
+      setStatus('Opening camera...');
       
+      // Open camera (which will start camera voice listener)
+      await openCamera();
+      break;
+
     default:
       await voiceSpeakText('Unknown command');
       setStatus('Unknown command');
@@ -534,93 +778,92 @@ const executeVoiceCommand = async (action: string) => {
     <Text style={styles.previewLabel}>Captured Image:</Text>
     <Image source={{ uri: capturedImage }} style={styles.thumbnail} />
     
-    {extractedText && (
+    {/* CHANGED: Only show if medicationInfo exists */}
+    {medicationInfo ? (
       <View style={styles.textResultContainer}>
         <Text style={styles.textCategoryLabel}>Category: {textCategory}</Text>
         
         {/* Show extracted medical information */}
-       {medicationInfo && (
-  <View style={styles.medInfoContainer}>
-    {medicationInfo.drugName && (
-      <View style={styles.medInfoField}>
-        <Text style={styles.medInfoLabel}>Drug:</Text>
-        <Text style={styles.medInfoValue}>{medicationInfo.drugName}</Text>
-      </View>
-    )}
-    
-    {medicationInfo.medicationType && (
-      <View style={styles.medInfoField}>
-        <Text style={styles.medInfoLabel}>Type:</Text>
-        <Text style={styles.medInfoValue}>{medicationInfo.medicationType}</Text>
-      </View>
-    )}
-    
-    {medicationInfo.quantity && (
-      <View style={styles.medInfoField}>
-        <Text style={styles.medInfoLabel}>Quantity:</Text>
-        <Text style={styles.medInfoValue}>{medicationInfo.quantity}</Text>
-      </View>
-    )}
-    
-    {medicationInfo.dosageAmount && (
-      <View style={styles.medInfoField}>
-        <Text style={styles.medInfoLabel}>Dosage:</Text>
-        <Text style={styles.medInfoValue}>{medicationInfo.dosageAmount}</Text>
-      </View>
-    )}
-    
-    {medicationInfo.dosageInstructions && (
-      <View style={styles.medInfoField}>
-        <Text style={styles.medInfoLabel}>Instructions:</Text>
-        <Text style={styles.medInfoValue}>{medicationInfo.dosageInstructions}</Text>
-      </View>
-    )}
-    
-    {medicationInfo.timing && (
-      <View style={styles.medInfoField}>
-        <Text style={styles.medInfoLabel}>Timing:</Text>
-        <Text style={styles.medInfoValue}>{medicationInfo.timing}</Text>
-      </View>
-    )}
-    
-    {medicationInfo.purpose && (
-      <View style={styles.medInfoField}>
-        <Text style={styles.medInfoLabel}>Purpose:</Text>
-        <Text style={styles.medInfoValue}>{medicationInfo.purpose}</Text>
-      </View>
-    )}
-    
-    {medicationInfo.warnings && medicationInfo.warnings.length > 0 && (
-      <View style={styles.medInfoField}>
-        <Text style={[styles.medInfoLabel, styles.medInfoWarning]}>⚠️ Warnings:</Text>
-        <Text style={styles.medInfoWarning}>
-          {medicationInfo.warnings.join(', ')}
-        </Text>
-      </View>
-    )}
-    
-    {medicationInfo.expirationDate && (
-      <View style={styles.medInfoField}>
-        <Text style={styles.medInfoLabel}>Expires:</Text>
-        <Text style={styles.medInfoValue}>{medicationInfo.expirationDate}</Text>
-      </View>
-    )}
-    
-    {medicationInfo.prescriptionDate && (
-      <View style={styles.medInfoField}>
-        <Text style={styles.medInfoLabel}>Prescribed:</Text>
-        <Text style={styles.medInfoValue}>{medicationInfo.prescriptionDate}</Text>
-      </View>
-    )}
-    
-    {medicationInfo.pharmacy && (
-      <View style={styles.medInfoField}>
-        <Text style={styles.medInfoLabel}>Clinic:</Text>
-        <Text style={styles.medInfoValue}>{medicationInfo.pharmacy}</Text>
-      </View>
-    )}
-  </View>
-)}
+        <View style={styles.medInfoContainer}>
+          {medicationInfo.drugName && (
+            <View style={styles.medInfoField}>
+              <Text style={styles.medInfoLabel}>Drug:</Text>
+              <Text style={styles.medInfoValue}>{medicationInfo.drugName}</Text>
+            </View>
+          )}
+          
+          {medicationInfo.medicationType && (
+            <View style={styles.medInfoField}>
+              <Text style={styles.medInfoLabel}>Type:</Text>
+              <Text style={styles.medInfoValue}>{medicationInfo.medicationType}</Text>
+            </View>
+          )}
+          
+          {medicationInfo.quantity && (
+            <View style={styles.medInfoField}>
+              <Text style={styles.medInfoLabel}>Quantity:</Text>
+              <Text style={styles.medInfoValue}>{medicationInfo.quantity}</Text>
+            </View>
+          )}
+          
+          {medicationInfo.dosageAmount && (
+            <View style={styles.medInfoField}>
+              <Text style={styles.medInfoLabel}>Dosage:</Text>
+              <Text style={styles.medInfoValue}>{medicationInfo.dosageAmount}</Text>
+            </View>
+          )}
+          
+          {medicationInfo.dosageInstructions && (
+            <View style={styles.medInfoField}>
+              <Text style={styles.medInfoLabel}>Instructions:</Text>
+              <Text style={styles.medInfoValue}>{medicationInfo.dosageInstructions}</Text>
+            </View>
+          )}
+          
+          {medicationInfo.timing && (
+            <View style={styles.medInfoField}>
+              <Text style={styles.medInfoLabel}>Timing:</Text>
+              <Text style={styles.medInfoValue}>{medicationInfo.timing}</Text>
+            </View>
+          )}
+          
+          {medicationInfo.purpose && (
+            <View style={styles.medInfoField}>
+              <Text style={styles.medInfoLabel}>Purpose:</Text>
+              <Text style={styles.medInfoValue}>{medicationInfo.purpose}</Text>
+            </View>
+          )}
+          
+          {medicationInfo.warnings && medicationInfo.warnings.length > 0 && (
+            <View style={styles.medInfoField}>
+              <Text style={[styles.medInfoLabel, styles.medInfoWarning]}>⚠️ Warnings:</Text>
+              <Text style={styles.medInfoWarning}>
+                {medicationInfo.warnings.join(', ')}
+              </Text>
+            </View>
+          )}
+          
+          {medicationInfo.expirationDate && (
+            <View style={styles.medInfoField}>
+              <Text style={styles.medInfoLabel}>Expires:</Text>
+              <Text style={styles.medInfoValue}>{medicationInfo.expirationDate}</Text>
+            </View>
+          )}
+          
+          {medicationInfo.prescriptionDate && (
+            <View style={styles.medInfoField}>
+              <Text style={styles.medInfoLabel}>Prescribed:</Text>
+              <Text style={styles.medInfoValue}>{medicationInfo.prescriptionDate}</Text>
+            </View>
+          )}
+          
+          {medicationInfo.pharmacy && (
+            <View style={styles.medInfoField}>
+              <Text style={styles.medInfoLabel}>Clinic:</Text>
+              <Text style={styles.medInfoValue}>{medicationInfo.pharmacy}</Text>
+            </View>
+          )}
+        </View>
         
         {/* Show missing fields warning */}
         {missingFieldsWarning && (
@@ -633,14 +876,34 @@ const executeVoiceCommand = async (action: string) => {
         <Text style={styles.extractedTextLabel}>Raw Text:</Text>
         <Text style={styles.extractedText}>{extractedText}</Text>
       </View>
-    )}
+    ) : extractedText ? (
+      /* NEW: Show error when OCR worked but no medication info */
+      <View style={styles.errorContainer}>
+        <Text style={styles.errorText}>❌ No Medication Information Found</Text>
+        <Text style={styles.errorSubtext}>
+          The image was scanned but no medication details were detected.
+        </Text>
+        <TouchableOpacity 
+          style={styles.retryButton}
+          onPress={() => {
+            setCapturedImage(null);
+            setExtractedText('');
+            openCamera();
+          }}
+        >
+          <Text style={styles.retryButtonText}>📷 Retake Photo</Text>
+        </TouchableOpacity>
+      </View>
+    ) : null}
   </View>
 )}
-
         <View style={styles.buttonContainer}>
           <TouchableOpacity 
             style={styles.button}
-            onPress={openCamera}
+             onPress={() => {
+              stopSpeaking();
+              openCamera();
+            }}
             disabled={isProcessing}
           >
             <Text style={styles.buttonText}>📷 Capture & Read Text</Text>
@@ -648,7 +911,10 @@ const executeVoiceCommand = async (action: string) => {
 
           <TouchableOpacity 
             style={[styles.button, styles.uploadButton]}
-            onPress={pickImage}
+            onPress={() => {
+              stopSpeaking();
+              pickImage();
+            }}
             disabled={isProcessing}
           >
             <Text style={styles.buttonText}>📁 Upload Test Image</Text>
@@ -656,7 +922,10 @@ const executeVoiceCommand = async (action: string) => {
 
           <TouchableOpacity 
             style={styles.button}
-            onPress={handleVoice}
+            onPress={() => {
+              stopSpeaking();
+              handleVoice();
+            }}
           >
             <Text style={styles.buttonText}>🎤 Voice Command</Text>
           </TouchableOpacity>
@@ -678,7 +947,12 @@ const executeVoiceCommand = async (action: string) => {
             <View style={styles.cameraOverlay}>
               <TouchableOpacity 
                 style={styles.closeButton}
-                onPress={() => setShowCamera(false)}
+                onPress={async () => {
+                stopSpeaking();
+                await Voice.stop();
+                voiceContextRef.current = 'main'; // CHANGED
+                setShowCamera(false);
+                }}
               >
                 <Text style={styles.closeButtonText}>✕ Close</Text>
               </TouchableOpacity>
@@ -691,7 +965,10 @@ const executeVoiceCommand = async (action: string) => {
               <View style={styles.captureButtonContainer}>
                 <TouchableOpacity 
                   style={styles.captureButton}
-                  onPress={takePicture}
+                  onPress={() => {
+                    stopSpeaking();
+                    takePicture();
+                  }}
                 >
                   <View style={styles.captureButtonInner} />
                 </TouchableOpacity>
@@ -935,4 +1212,40 @@ const styles = StyleSheet.create({
     borderLeftWidth: 3,
     borderLeftColor: '#ff6b6b',
   },
+  errorContainer: {
+  backgroundColor: '#8b0000',
+  padding: 20,
+  borderRadius: 8,
+  marginTop: 15,
+  alignItems: 'center',
+},
+errorText: {
+  color: '#ffffff',
+  fontSize: 16,
+  fontWeight: 'bold',
+  textAlign: 'center',
+  marginBottom: 8,
+},
+errorSubtext: {
+  color: '#ffcccc',
+  fontSize: 14,
+  textAlign: 'center',
+  marginBottom: 10,
+},
+retryButton: {
+  backgroundColor: '#4ecca3',
+  paddingHorizontal: 20,
+  paddingVertical: 12,
+  borderRadius: 8,
+  marginTop: 10,
+},
+retryButtonText: {
+  color: '#ffffff',
+  fontSize: 16,
+  fontWeight: '600',
+},
+medInfoValue: {
+  color: '#ffffff',
+  fontSize: 14,
+},
 });

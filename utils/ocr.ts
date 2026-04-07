@@ -1,7 +1,20 @@
 const OCR_API_KEY = 'K87899142388957';
 
+export interface TextBlock {
+  text: string;
+  boundingBox: {
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+  };
+}
+
 export interface OCRResult {
   text: string;
+  textBlocks: TextBlock[];
+  imageWidth: number;
+  imageHeight: number;
   confidence: number;
   blocks: Array<{
     text: string;
@@ -31,12 +44,13 @@ export async function extractText(imageUri: string): Promise<OCRResult> {
 
     console.log('Image converted to base64');
 
-    // Call OCR.space API
+    // Call OCR.space API with TextOverlay enabled
     const formData = new FormData();
     formData.append('base64Image', `data:image/jpeg;base64,${base64}`);
     formData.append('apikey', OCR_API_KEY);
     formData.append('language', 'eng');
-    formData.append('isOverlayRequired', 'false');
+    formData.append('isOverlayRequired', 'true'); // CHANGED: Enable overlay for bounding boxes
+    formData.append('OCREngine', '2'); // ADDED: Use Engine 2 for better results
 
     console.log('Calling OCR API...');
 
@@ -49,12 +63,54 @@ export async function extractText(imageUri: string): Promise<OCRResult> {
     console.log('OCR Response received');
 
     if (result.OCRExitCode === 1 && result.ParsedResults?.length > 0) {
-      const parsedText = result.ParsedResults[0].ParsedText || '';
+      const parsedResult = result.ParsedResults[0];
+      const parsedText = parsedResult.ParsedText || '';
       
       console.log('OCR Success!');
       
+      // EXTRACT TEXT BLOCKS WITH POSITIONS
+      const textBlocks: TextBlock[] = [];
+      
+      if (parsedResult.TextOverlay && parsedResult.TextOverlay.Lines) {
+        console.log(`📊 Found ${parsedResult.TextOverlay.Lines.length} lines`);
+        
+        for (const line of parsedResult.TextOverlay.Lines) {
+          if (line.Words) {
+            for (const word of line.Words) {
+              textBlocks.push({
+                text: word.WordText,
+                boundingBox: {
+                  left: word.Left,
+                  top: word.Top,
+                  width: word.Width,
+                  height: word.Height
+                }
+              });
+            }
+          }
+        }
+      }
+      
+      console.log(`📊 Extracted ${textBlocks.length} text blocks`);
+      
+      // Calculate image dimensions from text blocks
+      let maxX = 0;
+      let maxY = 0;
+      
+      for (const block of textBlocks) {
+        const right = block.boundingBox.left + block.boundingBox.width;
+        const bottom = block.boundingBox.top + block.boundingBox.height;
+        if (right > maxX) maxX = right;
+        if (bottom > maxY) maxY = bottom;
+      }
+      
+      console.log(`📐 Estimated image dimensions: ${maxX} x ${maxY}`);
+      
       return {
         text: parsedText.trim(),
+        textBlocks: textBlocks,
+        imageWidth: maxX || 1024,
+        imageHeight: maxY || 768,
         confidence: 0.9,
         blocks: [{ text: parsedText }],
       };
@@ -67,6 +123,7 @@ export async function extractText(imageUri: string): Promise<OCRResult> {
     throw error;
   }
 }
+
 
 export function categorizeMedicalText(text: string): string {
   const lower = text.toLowerCase();
